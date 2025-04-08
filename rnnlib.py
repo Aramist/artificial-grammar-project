@@ -49,6 +49,13 @@ class LRUModel(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ):
+        self.dim_in = dim_in
+        self.dim_hidden = dim_hidden
+        self.dim_out = dim_out
+        self.mlp_depth = mlp_depth
+        self.num_layers = num_layers
+        self.rngs = rngs
+
         self.lru_blocks = [
             LRUBlock(dim_in=dim_in, dim_out=dim_hidden, num_layers=mlp_depth, rngs=rngs)
         ] + (num_layers - 1) * [
