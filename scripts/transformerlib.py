@@ -288,6 +288,8 @@ class TransformerLayer(nnx.Module):
             query_sequence=sequence, kv_sequence=sequence, mask=mask
         )
 
+        self.sow(nnx.Intermediate, "attn_weights", attn_weights)
+
         sequence = self.norm1(sequence + mha_output)
 
         sequence = self.norm2(sequence + self.ffn(sequence))
