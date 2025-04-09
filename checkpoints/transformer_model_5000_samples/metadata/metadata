@@ -1,1 +1,0 @@
-{"vocab_size": 6, "d_embedding": 64, "max_seq_len": 512, "num_layers": 1, "d_model": 64, "num_heads": 1, "d_feedforward": 128, "attn_dropout_p": 0.0}

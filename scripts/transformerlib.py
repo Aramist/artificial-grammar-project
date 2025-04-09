@@ -1,10 +1,182 @@
-from functools import partial
-from typing import Optional
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import orbax.checkpoint as ocp
 import torch
+import utils
 from flax import nnx
+
+# MARK: pytorch
+############## PyTorch Implementation ##############
+
+
+class PytorchSinCosPositionalEmbedding(torch.nn.Module):
+    def __init__(self, d_model: int, max_len: int = 512):
+        """Creates a sinusoidal positional embedding according to Vaswani et al. (2017).
+
+        Args:
+            d_model (int): Embedding dimensionality
+            max_len (int, optional): Maximum sequence length. Defaults to 512.
+        """
+
+        super().__init__()
+        self.d_model = d_model
+        self.max_len = max_len
+
+        # Create the positional embedding matrix
+        position = torch.arange(max_len)[:, None]
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * -(torch.log(torch.tensor(10000.0)) / d_model)
+        )
+        pos_emb = torch.zeros((max_len, d_model))
+        pos_emb[:, 0::2] = torch.sin(position * div_term)
+        pos_emb[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pos_emb", pos_emb)
+        # The positional embedding matrix is of shape (max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies the positional embedding to the input sequence.
+
+        Args:
+            x (torch.Tensor): Input sequence of shape (*batch, seq_len, d_model)
+
+        Returns:
+            torch.Tensor: Positional embedding of shape (*batch, seq_len, d_model)
+        """
+        batch_shape = x.shape[:-2]
+        seq_len = x.shape[-2]
+        pos_emb = self.pos_emb[:seq_len, :].expand(*batch_shape, seq_len, self.d_model)
+        return x + pos_emb
+
+
+class PytorchTransformerLM(torch.nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        max_seq_len: int,
+        d_embedding: int,
+        num_layers: int,
+        d_model: int,
+        num_heads: int,
+        d_feedforward: int,
+        attn_dropout_p: float = 0.0,
+    ):
+        """Pytorch implementation of a transformer for language modeling for comparison with JAX.
+
+        Args:
+            vocab_size (int): Number of tokens in the vocabulary
+            max_seq_len (int): Maximum sequence length
+            d_embedding (int): Dimension of the language embedding
+            num_layers (int): Number of transformer layers
+            d_model (int): Dimension of the transformer's hidden state
+            num_heads (int): Number of attention heads
+            d_feedforward (int): Dimension of the feedforward layers inside the transformer
+            attn_dropout_p (float, optional): Dropout probability for attention. Defaults to 0.0.
+        """
+
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.max_seq_len = max_seq_len
+        self.d_embedding = d_embedding
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_feedforward = d_feedforward
+        self.attn_dropout_p = attn_dropout_p
+
+        self.lang_embedding = torch.nn.Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=d_embedding,
+        )
+        self.initial_linear = torch.nn.Linear(
+            in_features=d_embedding,
+            out_features=d_model,
+        )
+        self.final_linear = torch.nn.Linear(
+            in_features=d_model,
+            out_features=vocab_size,
+        )
+        self.pos_emb = PytorchSinCosPositionalEmbedding(
+            d_model=d_model, max_len=max_seq_len
+        )
+        self.transformer = torch.nn.TransformerEncoder(
+            torch.nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=d_feedforward,
+                dropout=attn_dropout_p,
+                batch_first=True,
+            ),
+            num_layers=num_layers,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies the transformer to the input sequence for training.
+
+        Args:
+            x (torch.Tensor): Input sequence of shape (*batch, seq_len). Entries should be indices into
+                the vocabulary.
+
+        Returns:
+            torch.Tensor: Output sequence of shape (*batch, seq_len, vocab_size) representing the logits for each token in the vocabulary.
+        """
+        # Apply the language embedding
+        x = self.lang_embedding(x)  # (*batch, seq_len, d_embedding)
+        # Apply the initial linear layer
+        x = self.initial_linear(x)  # (*batch, seq_len, d_model)
+        # Apply the positional embedding
+        x = self.pos_emb(x)  # (*batch, seq_len, d_model)
+        # Apply the transformer
+        mask = torch.nn.Transformer.generate_square_subsequent_mask(
+            sz=x.shape[-2], device=x.device, dtype=x.dtype
+        )
+        x = self.transformer(x, mask=mask, is_causal=True)  # (*batch, seq_len, d_model)
+        # (*batch, seq_len, d_model)
+        # Apply the final linear layer
+        x = self.final_linear(x)  # (*batch, seq_len, vocab_size)
+        # At each position 't', the result is a distribution of logits for the token 't+1'
+        return x
+
+
+class PytorchHMMDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        emissions: torch.Tensor,
+        states: torch.Tensor,
+    ):
+        """Dataset for HMM training.
+
+        Args:
+            emissions (torch.Tensor): Emissions of shape (num_samples, seq_len, num_states)
+            states (torch.Tensor): States of shape (num_samples, seq_len)
+        """
+        self.emissions = emissions
+        self.states = states
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gets the emissions and states for a given index.
+
+        Args:
+            idx (int): Index of the sample to get
+
+        Returns:
+            torch.Tensor: Emissions of shape (seq_len)
+            torch.Tensor: States int tensor of shape (seq_len)
+        """
+        return self.emissions[idx], self.states[idx]
+
+    def __len__(self) -> int:
+        """Returns the number of samples in the dataset.
+
+        Returns:
+            int: Number of samples in the dataset
+        """
+        return self.emissions.shape[0]
+
+
+############## End PyTorch Implementation ##############
+# MARK: Jax
 
 
 def make_causal_attn_mask(num_tokens: int) -> jax.Array:
@@ -415,6 +587,27 @@ class SinCosPositionalEmbedding(nnx.Module):
 
 
 class TransformerLM(nnx.Module):
+    @classmethod
+    def from_metadata(cls, metadata: dict, rngs: nnx.Rngs) -> "TransformerLM":
+        """Creates a transformer from metadata.
+        Args:
+            metadata (dict): Metadata dictionary containing the parameters for the transformer.
+            rngs (nnx.Rngs): Random streams for parameter initialization and dropout.
+        Returns:
+            TransformerLM: Transformer model with the specified parameters.
+        """
+        return cls(
+            vocab_size=metadata["vocab_size"],
+            max_seq_len=metadata["max_seq_len"],
+            d_embedding=metadata["d_embedding"],
+            num_layers=metadata["num_layers"],
+            d_model=metadata["d_model"],
+            num_heads=metadata["num_heads"],
+            d_feedforward=metadata["d_feedforward"],
+            attn_dropout_p=metadata["attn_dropout_p"],
+            rngs=rngs,
+        )
+
     def __init__(
         self,
         *,
@@ -452,6 +645,19 @@ class TransformerLM(nnx.Module):
         self.d_feedforward = d_feedforward
         self.attn_dropout_p = attn_dropout_p
         self.rngs = rngs
+
+        # Save all initialization info in one place to make it easier to save and load
+        self.metadata = {
+            "vocab_size": vocab_size,
+            "max_seq_len": max_seq_len,
+            "d_embedding": d_embedding,
+            "num_layers": num_layers,
+            "d_model": d_model,
+            "num_heads": num_heads,
+            "d_feedforward": d_feedforward,
+            "attn_dropout_p": attn_dropout_p,
+        }
+
         self.lang_embedding = nnx.Embed(
             num_embeddings=vocab_size,
             features=d_embedding,
@@ -516,184 +722,41 @@ class TransformerLM(nnx.Module):
         """
         return self.forward(x)
 
-
-############## PyTorch Implementation ##############
-
-
-class PytorchSinCosPositionalEmbedding(torch.nn.Module):
-    def __init__(self, d_model: int, max_len: int = 512):
-        """Creates a sinusoidal positional embedding according to Vaswani et al. (2017).
+    def save(self, save_dir: Path) -> None:
+        """Saves the transformer model to a file.
 
         Args:
-            d_model (int): Embedding dimensionality
-            max_len (int, optional): Maximum sequence length. Defaults to 512.
+            save_dir (Path): Path to save the model to.
+
+        Raises:
+            ValueError: If the directory already exists.
         """
 
-        super().__init__()
-        self.d_model = d_model
-        self.max_len = max_len
+        # orbax only accepts absolute paths
+        save_dir = save_dir.absolute()
+        if save_dir.exists():
+            # Raise an error if the directory already exists
+            raise ValueError(f"Directory {save_dir} already exists.")
 
-        # Create the positional embedding matrix
-        position = torch.arange(max_len)[:, None]
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) * -(torch.log(torch.tensor(10000.0)) / d_model)
-        )
-        pos_emb = torch.zeros((max_len, d_model))
-        pos_emb[:, 0::2] = torch.sin(position * div_term)
-        pos_emb[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pos_emb", pos_emb)
-        # The positional embedding matrix is of shape (max_len, d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies the positional embedding to the input sequence.
-
-        Args:
-            x (torch.Tensor): Input sequence of shape (*batch, seq_len, d_model)
-
-        Returns:
-            torch.Tensor: Positional embedding of shape (*batch, seq_len, d_model)
-        """
-        batch_shape = x.shape[:-2]
-        seq_len = x.shape[-2]
-        pos_emb = self.pos_emb[:seq_len, :].expand(*batch_shape, seq_len, self.d_model)
-        return x + pos_emb
-
-
-class PytorchTransformerLM(torch.nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        max_seq_len: int,
-        d_embedding: int,
-        num_layers: int,
-        d_model: int,
-        num_heads: int,
-        d_feedforward: int,
-        attn_dropout_p: float = 0.0,
-    ):
-        """Pytorch implementation of a transformer for language modeling for comparison with JAX.
-
-        Args:
-            vocab_size (int): Number of tokens in the vocabulary
-            max_seq_len (int): Maximum sequence length
-            d_embedding (int): Dimension of the language embedding
-            num_layers (int): Number of transformer layers
-            d_model (int): Dimension of the transformer's hidden state
-            num_heads (int): Number of attention heads
-            d_feedforward (int): Dimension of the feedforward layers inside the transformer
-            attn_dropout_p (float, optional): Dropout probability for attention. Defaults to 0.0.
-        """
-
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
-        self.d_embedding = d_embedding
-        self.num_layers = num_layers
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_feedforward = d_feedforward
-        self.attn_dropout_p = attn_dropout_p
-
-        self.lang_embedding = torch.nn.Embedding(
-            num_embeddings=vocab_size,
-            embedding_dim=d_embedding,
-        )
-        self.initial_linear = torch.nn.Linear(
-            in_features=d_embedding,
-            out_features=d_model,
-        )
-        self.final_linear = torch.nn.Linear(
-            in_features=d_model,
-            out_features=vocab_size,
-        )
-        self.pos_emb = PytorchSinCosPositionalEmbedding(
-            d_model=d_model, max_len=max_seq_len
-        )
-        self.transformer = torch.nn.TransformerEncoder(
-            torch.nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=num_heads,
-                dim_feedforward=d_feedforward,
-                dropout=attn_dropout_p,
-                batch_first=True,
+        transformer_meta = self.metadata
+        _, _, transformer_state = nnx.split(self, nnx.RngState, ...)
+        transformer_ckptr = ocp.Checkpointer(ocp.CompositeCheckpointHandler())
+        transformer_ckptr.save(
+            save_dir,
+            args=ocp.args.Composite(
+                state=ocp.args.StandardSave(transformer_state),
+                metadata=ocp.args.JsonSave(transformer_meta),
             ),
-            num_layers=num_layers,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies the transformer to the input sequence for training.
+    @classmethod
+    def load_from_save(cls, save_dir: Path) -> "TransformerLM":
+        """Loads the transformer model from a file.
 
         Args:
-            x (torch.Tensor): Input sequence of shape (*batch, seq_len). Entries should be indices into
-                the vocabulary.
+            save_dir (Path): Path to load the model from.
 
         Returns:
-            torch.Tensor: Output sequence of shape (*batch, seq_len, vocab_size) representing the logits for each token in the vocabulary.
+            TransformerLM: Loaded transformer model.
         """
-        # Apply the language embedding
-        x = self.lang_embedding(x)  # (*batch, seq_len, d_embedding)
-        # Apply the initial linear layer
-        x = self.initial_linear(x)  # (*batch, seq_len, d_model)
-        # Apply the positional embedding
-        x = self.pos_emb(x)  # (*batch, seq_len, d_model)
-        # Apply the transformer
-        mask = torch.nn.Transformer.generate_square_subsequent_mask(
-            sz=x.shape[-2], device=x.device, dtype=x.dtype
-        )
-        x = self.transformer(x, mask=mask, is_causal=True)  # (*batch, seq_len, d_model)
-        # (*batch, seq_len, d_model)
-        # Apply the final linear layer
-        x = self.final_linear(x)  # (*batch, seq_len, vocab_size)
-        # At each position 't', the result is a distribution of logits for the token 't+1'
-        return x
-
-
-class PytorchHMMDataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        emissions: torch.Tensor,
-        states: torch.Tensor,
-    ):
-        """Dataset for HMM training.
-
-        Args:
-            emissions (torch.Tensor): Emissions of shape (num_samples, seq_len, num_states)
-            states (torch.Tensor): States of shape (num_samples, seq_len)
-        """
-        self.emissions = emissions
-        self.states = states
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gets the emissions and states for a given index.
-
-        Args:
-            idx (int): Index of the sample to get
-
-        Returns:
-            torch.Tensor: Emissions of shape (seq_len)
-            torch.Tensor: States int tensor of shape (seq_len)
-        """
-        return self.emissions[idx], self.states[idx]
-
-    def __len__(self) -> int:
-        """Returns the number of samples in the dataset.
-
-        Returns:
-            int: Number of samples in the dataset
-        """
-        return self.emissions.shape[0]
-
-
-if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    norms = []
-    lens = 2 ** jnp.arange(4, 12)
-    for len in lens:
-        test = SinCosPositionalEmbedding(int(len), 512)
-        norm = jnp.linalg.norm(test.pos_emb) / jnp.sqrt(len)
-        norms.append(norm.item())
-
-    plt.plot(np.array(lens), norms)
-    plt.show()
+        return utils.load_model(save_dir.absolute(), cls)

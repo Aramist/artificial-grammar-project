@@ -3,12 +3,11 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import rnnlib
+import transformerlib
 from dynamax.hidden_markov_model import CategoricalHMM
 from flax import nnx
 from orbax import checkpoint as ocp
-
-import rnnlib
-import transformerlib
 
 
 def load_model(checkpoint_dir: Path, model_class: tp.Type[nnx.Module]) -> nnx.Module:
@@ -41,7 +40,7 @@ def sample_rollouts(
     transition_matrix: jax.Array,
     emission_matrix: jax.Array,
     rng: jax.random.PRNGKey,
-) -> tp.Tuple[jax.Array, jax.Array]:
+) -> tp.Tuple[jax.Array, jax.Array, jax.Array]:
     """Samples sequences of observations and hidden states from a hidden Markov model.
 
     Args:

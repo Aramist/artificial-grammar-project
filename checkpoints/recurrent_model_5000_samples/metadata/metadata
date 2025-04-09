@@ -1,1 +1,0 @@
-{"dim_in": 6, "dim_hidden": 64, "dim_out": 6, "mlp_depth": 3, "num_layers": 3}
